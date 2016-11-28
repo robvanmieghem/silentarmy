@@ -9,8 +9,16 @@ import struct
 import json
 import binascii
 import re
-import asyncio
 import logging
+
+try:
+    import asyncio
+except ImportError as e:
+    # system doesn't provide asyncio module (eg. Python 3.3),
+    # so use module bundled with silentarmy
+    p = os.path.join(sys.path[0], 'thirdparty', 'asyncio')
+    sys.path.insert(1, p) # make it the 2nd path
+    import asyncio
 
 verbose_level = 0
 
@@ -34,11 +42,21 @@ def very_verbose(msg):
     if verbose_level > 1:
         print(msg)
 
+def my_ensure_future(coro):
+    loop = asyncio.get_event_loop()
+    task = loop.create_task(coro)
+    return task
+
 def parse_url(url):
-    '''Return (host, port) from "stratum+tcp://host:port"'''
+    '''Return (host, port, xnsub) from "stratum+tcp://host:port" optionally
+    postfixed with #xnsub or /#xnsub (in which case xnsub is set to True)'''
     prefix = 'stratum+tcp://'
     if not url.startswith(prefix):
         fatal('Invalid stratum url: %s' % url)
+    xnsub = False
+    if url.endswith('#xnsub'):
+        xnsub = True
+        url = url[:-len('#xnsub')].strip('/')
     url = url[len(prefix):]
     colon = url.rfind(':')
     if colon == -1:
@@ -51,7 +69,7 @@ def parse_url(url):
         port = int(port)
     except ValueError as e:
         fatal('Invalid port number: %s' % port)
-    return (url[:colon], int(url[colon + 1:]))
+    return (url[:colon], int(url[colon + 1:]), xnsub)
 
 def decode_solver_line(line):
     '''Decode a line read from the solver. 3 types of lines exist:
@@ -108,7 +126,7 @@ class StratumClientProtocol(asyncio.Protocol):
             print('Stratum: connection was closed (invalid user/pwd?)')
         else:
             print('Stratum: lost connection: %s' % exc)
-        asyncio.ensure_future(self.sa.reconnect())
+        my_ensure_future(self.sa.reconnect())
 
     #
     # other methods
@@ -132,10 +150,12 @@ class Silentarmy:
         self.solver_procs = {}
         self.solver_binary = os.path.join(sys.path[0], 'sa-solver')
         # Stratum-related attributes
+        self.st_transport = None
         self.st_conn_attempt = 0
         self.st_had_job = False
         self.st_protocol = StratumClientProtocol(self)
         self.st_state = 'DISCONNECTED'
+        self.st_extranonce = False
         self.st_id = 0
         self.st_expected_id = None
         self.st_accepted = 0
@@ -155,7 +175,7 @@ class Silentarmy:
         self.total_shares = {}
 
     def init(self):
-        (self.host, self.port) = parse_url(self.opts.pool)
+        (self.host, self.port, self.st_extranonce) = parse_url(self.opts.pool)
         if sys.platform == 'win32':
             # ProactorEventLoop needed to support subprocesses with Python 3.5
             self.loop = asyncio.ProactorEventLoop()
@@ -181,10 +201,10 @@ class Silentarmy:
         coro = self.loop.create_connection(lambda: self.st_protocol,
                 self.host, self.port)
         try:
-            yield from coro
+            (self.st_transport, _) = yield from coro
         except Exception as e:
             print("Stratum: error connecting: %s" % e)
-            asyncio.ensure_future(self.reconnect())
+            my_ensure_future(self.reconnect())
 
     @asyncio.coroutine
     def show_stats(self):
@@ -244,6 +264,7 @@ class Silentarmy:
             shares = sum(self.total_shares.values())
             print("Total %s sol/s [%s] %d share%s" % \
                     (rate_avg, info_gpus, shares, '' if shares == 1 else 's'))
+            sys.stdout.flush()
 
     def list_devices(self):
         try:
@@ -259,17 +280,12 @@ class Silentarmy:
         if self.opts.do_list:
             self.list_devices()
         self.init()
-        try:
-            asyncio.ensure_future(self.reconnect())
-        except AttributeError as e:
-            fatal(('Error calling ensure_future(): %s\n' % e) +
-                    'Please update to Python 3.4.5 (or above) - see ' +
-                    'https://github.com/mbevand/silentarmy/issues/8')
-        asyncio.ensure_future(self.show_stats())
+        my_ensure_future(self.reconnect())
+        my_ensure_future(self.show_stats())
         for gpuid in self.opts.use:
             for instid in range(self.opts.instances):
                 devid = "%d.%d" % (gpuid, instid)
-                asyncio.ensure_future(self.start_solvers(devid))
+                my_ensure_future(self.start_solvers(devid))
         try:
             self.loop.run_forever()
         except KeyboardInterrupt as e:
@@ -369,7 +385,7 @@ class Silentarmy:
                 if devid not in self.solver_procs:
                     # happens if solver crashed
                     print('Solver %s: not running, relaunching it' % devid)
-                    asyncio.ensure_future(self.start_solvers(devid))
+                    my_ensure_future(self.start_solvers(devid))
                     # TODO: ideally the mining job should be sent to the solver
                     # as soon as it is back up and running
         if not self.st_had_job:
@@ -388,9 +404,9 @@ class Silentarmy:
         self.nonce_leftpart = bytes.fromhex(n)
         l = len(self.nonce_leftpart)
         very_verbose('Stratum server fixes %d bytes of the nonce' % l)
-        if l > 16:
-            # SILENTARMY requires the last 12 bytes to be zero, then 4 bytes
-            # to vary the nonce, this leaves at most 16 bytes that can be
+        if l > 17:
+            # SILENTARMY requires the last 12 bytes to be zero, then 3 bytes
+            # to vary the nonce, this leaves at most 17 bytes that can be
             # fixed by the server.
             fatal('Stratum: SILENTARMY is not compatible with servers ' +
                     'fixing the first %d bytes of the nonce' % l)
@@ -439,10 +455,13 @@ class Silentarmy:
         '''Generate a stratum message to call the specified method.'''
         if method == 'mining.subscribe':
             p = ["silentarmy", None, self.host, str(self.port)]
+        elif method == 'mining.extranonce.subscribe':
+            p = []
         elif method == 'mining.authorize':
-            p = [self.opts.user]
             if self.opts.pwd:
-                p.append(self.opts.pwd)
+                p = [self.opts.user,self.opts.pwd]
+            else:
+                p = [self.opts.user,'']
         elif method == 'mining.submit':
             (job_id, ntime, nonce_rightpart, sol) = args
             p = [self.opts.user, job_id, ntime, nonce_rightpart, sol]
@@ -474,6 +493,14 @@ class Silentarmy:
                 if self.st_state == 'SENT_SUBSCRIBE':
                     # result: [ <ignored>, nonce_leftpart ]
                     self.set_nonce_leftpart(msg['result'][1])
+                    if self.st_extranonce:
+                        self.st_state = 'SENT_EXTRANONCE_SUBSCRIBE'
+                        return self.stratum_msg('mining.extranonce.subscribe')
+                    else:
+                        self.st_state = 'SENT_AUTHORIZE'
+                        return self.stratum_msg('mining.authorize')
+                elif self.st_state == 'SENT_EXTRANONCE_SUBSCRIBE':
+                    # ignore
                     self.st_state = 'SENT_AUTHORIZE'
                     return self.stratum_msg('mining.authorize')
                 elif self.st_state == 'SENT_AUTHORIZE':
@@ -493,11 +520,18 @@ class Silentarmy:
                 if msg['method'] == 'mining.set_target':
                     # params: [ target ]
                     self.set_target(msg['params'][0])
+                elif msg['method'] == 'mining.set_extranonce':
+                    # params: [ nonce_leftpart ]
+                    self.set_nonce_leftpart(msg['params'][0])
                 elif msg['method'] == 'mining.notify':
                     # params: [ job_id, nVersion, hashPrevBlock, hashMerkleRoot,
                     #   hashReserved, nTime, nBits, clean_jobs ]
                     self.set_new_job(*msg['params'][:8])
                     self.update_mining_job()
+                elif msg['method'] == 'client.reconnect':
+                    print("Stratum server forcing a reconnection")
+                    self.st_transport.close()
+                    # reconnection will happen automatically in connection_lost()
                 else:
                     raise Exception('Unimplemented method: %s' % msg['method'])
             else:
@@ -539,7 +573,8 @@ def main():
             "-c", "--connect",
             dest="pool", action="store", type="string", metavar="POOL",
             default='stratum+tcp://us1-zcash.flypool.org:3333',
-            help="connect to POOL, for example: stratum+tcp://example.com:1234")
+            help="connect to POOL, for example stratum+tcp://example.com:1234" +
+            " (add \"#xnsub\" to enable extranonce.subscribe)")
     parser.add_option(
             "-u", "--user",
             dest="user", action="store", type="string", metavar="USER",

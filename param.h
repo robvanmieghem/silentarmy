@@ -4,13 +4,20 @@
 #define NR_INPUTS                       (1 << PREFIX)
 // Approximate log base 2 of number of elements in hash tables
 #define APX_NR_ELMS_LOG                 (PREFIX + 1)
-// Number of rows and slots is affected by this. 20 offers the best performance
-// but occasionally misses ~1% of solutions.
+// Number of rows and slots is affected by this; 20 offers the best performance
 #define NR_ROWS_LOG                     20
 
-// Set this to 1 if you are using an AMD GPU with the Radeon Software Crimson
-// Edition driver (fglrx.ko), see README.md.
-#define OPTIM_FOR_FGLRX			0
+// Setting this to 1 might make SILENTARMY faster, see TROUBLESHOOTING.md
+#define OPTIM_SIMPLIFY_ROUND		1
+
+// Number of collision items to track, per thread
+#define COLL_DATA_SIZE_PER_TH		(NR_SLOTS * 5)
+
+// Ratio of time of sleeping before rechecking if task is done (0-1)
+#define SLEEP_RECHECK_RATIO 0.60
+// Ratio of time to busy wait for the solution (0-1)
+// The higher value the higher CPU usage with Nvidia
+#define SLEEP_SKIP_RATIO 0.005
 
 // Make hash tables OVERHEAD times larger than necessary to store the average
 // number of elements per row. The ideal value is as small as possible to
@@ -24,12 +31,13 @@
 // Even (as opposed to odd) values of OVERHEAD sometimes significantly decrease
 // performance as they cause VRAM channel conflicts.
 #if NR_ROWS_LOG == 16
+#error "NR_ROWS_LOG = 16 is currently broken - do not use"
 #define OVERHEAD                        3
 #elif NR_ROWS_LOG == 18
 #define OVERHEAD                        3
 #elif NR_ROWS_LOG == 19
 #define OVERHEAD                        5
-#elif NR_ROWS_LOG == 20 && OPTIM_FOR_FGLRX
+#elif NR_ROWS_LOG == 20 && OPTIM_SIMPLIFY_ROUND
 #define OVERHEAD                        6
 #elif NR_ROWS_LOG == 20
 #define OVERHEAD                        9
@@ -63,9 +71,19 @@
 // instructions. 10 is the max supported by the hw.
 #define BLAKE_WPS               	10
 // Maximum number of solutions reported by kernel to host
-#define MAX_SOLS			2000
+#define MAX_SOLS			10
 // Length of SHA256 target
 #define SHA256_TARGET_LEN               (256 / 8)
+
+#if (NR_SLOTS < 16)
+#define BITS_PER_ROW 4
+#define ROWS_PER_UINT 8
+#define ROW_MASK 0x0F
+#else
+#define BITS_PER_ROW 8
+#define ROWS_PER_UINT 4
+#define ROW_MASK 0xFF
+#endif
 
 // Optional features
 #undef ENABLE_DEBUG
